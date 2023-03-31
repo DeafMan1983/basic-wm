@@ -1,4 +1,4 @@
-﻿namespace basic_wm;
+namespace basic_wm;
 
 using System;
 using System.Collections.Generic;
@@ -11,6 +11,7 @@ using static TerraFX.Interop.Xlib.Xlib;
 
 using static basic_wm.ConvFunctions;
 using static basic_wm.Utils;
+using System.Linq;
 
 unsafe static class ConvFunctions
 {
@@ -79,7 +80,6 @@ unsafe class WindowManager
     private Display *display_;
     private Window root_;
     private Dictionary<Window, Window> clients_;
-
     private Position<int> drag_start_pos_, drag_start_frame_pos_;
     private Size<uint> drag_start_frame_size_;
     private Atom WM_PROTOCOLS, WM_DELETE_WINDOW;
@@ -103,6 +103,8 @@ unsafe class WindowManager
         this.root_ = XDefaultRootWindow(display_);
         this.WM_PROTOCOLS = XInternAtom(display_, StringFromHeap("WM_PROTOCOLS"), False);
         this.WM_DELETE_WINDOW = XInternAtom(display_, StringFromHeap("WM_DELETE_WINDOW"), False);
+        this.clients_ = new Dictionary<Window, Window>();
+        this.wm_detected_mutex_ = new Mutex();
     }
 
     ~WindowManager()
@@ -112,8 +114,7 @@ unsafe class WindowManager
 
     public void Run()
     {
-        wm_detected_mutex_ = new Mutex(false, "WM_DETECTED_MUTEX");
-        wm_detected_ = false;
+        wm_detected_ = true;
         try
         {
             wm_detected_ = wm_detected_mutex_.WaitOne();
@@ -203,13 +204,20 @@ unsafe class WindowManager
 
     public void Frame(Window w, bool was_created_before_window_manager)
     {
-        clients_ = new Dictionary<Window, Window>();
+        if (!clients_.ContainsKey(w))
+        {
+            return;
+        }
+
         uint BORDER_WIDTH = 5;
         ulong BORDER_COLOR = 0xff5500;
         ulong BG_COLOR = 0x111111;
 
         XWindowAttributes x_window_attrs;
-        XGetWindowAttributes(display_, w, &x_window_attrs);
+        if (Convert.ToBoolean(XGetWindowAttributes(display_, w, &x_window_attrs)))
+        {
+            return;
+        }
 
         if (was_created_before_window_manager) {
             if (x_window_attrs.override_redirect != False || x_window_attrs.map_state != IsViewable) {
@@ -239,6 +247,11 @@ unsafe class WindowManager
 
     public void Unframe(Window w)
     {
+        if (clients_.ContainsKey(w))
+        {
+            return;
+        }
+
         Window frame = clients_[w];
         XUnmapWindow(display_, frame);
 
@@ -246,6 +259,8 @@ unsafe class WindowManager
 
         XRemoveFromSaveSet(display_, w);
         XDestroyWindow(display_, frame);
+
+        clients_.Remove(w);
     }
 
     private void OnCreateNotify(XCreateWindowEvent e)
@@ -266,9 +281,16 @@ unsafe class WindowManager
 
     private void OnUnmapNotify(XUnmapEvent e)
     {
-        if (e.@event == root_)
+        if (!clients_.ContainsKey(e.window))
+        {
+            Console.WriteLine("Ignore UnmapNotify for non-client window {0}", e.window);
+            return;
+        }
+
+        if(e.@event == root_)
         {
             Console.WriteLine("Ignore UnmapNotify for reparented pre-existing window {0}", e.window);
+            return;
         }
 
         Unframe(e.window);
@@ -295,7 +317,7 @@ unsafe class WindowManager
         changes.sibling = e.above;
         changes.stack_mode = e.detail;
 
-        if (clients_[e.window] != null)
+        if (clients_.ContainsKey(e.window))
         {
             Window frame = clients_[e.window];
             XConfigureWindow(display_, frame, (uint)e.value_mask, &changes);
@@ -306,6 +328,11 @@ unsafe class WindowManager
 
     private void OnButtonPress(XButtonEvent e)
     {
+        if(clients_.ContainsKey(e.window))
+        {
+            return;
+        }
+
         Window frame = clients_[e.window];
         drag_start_pos_ = new Position<int>(e.x_root, e.y_root);
 
@@ -326,20 +353,26 @@ unsafe class WindowManager
 
     private void OnMotionNotify(XMotionEvent e)
     {
+        if(clients_.ContainsKey(e.window))
+        {
+            return;
+        }
+
         Window frame = clients_[e.window];
         Position<int> drag_pos = new Position<int>(e.x_root, e.y_root);
         Position<int> delta = new();
         delta.X = drag_pos.X - drag_start_pos_.X;
         delta.Y = drag_pos.Y - drag_start_pos_.Y;
 
-        if (e.state == Button1Mask)
+        bool state = Convert.ToBoolean(e.state); 
+        if (state & Convert.ToBoolean(Button1Mask))
         {
             Position<int> dest_frame_pos = new();
             dest_frame_pos.X = drag_start_frame_pos_.X + delta.X;
             dest_frame_pos.Y = drag_start_frame_pos_.Y + delta.Y;
             XMoveWindow(display_, frame, dest_frame_pos.X, dest_frame_pos.Y);
         }
-        else if (e.state == Button3Mask)
+        else if (state & Convert.ToBoolean(Button3Mask))
         {
             Size<uint> size_delta = new();
             size_delta.width = (uint)Math.Max(delta.X, -drag_start_frame_size_.width);
@@ -358,9 +391,10 @@ unsafe class WindowManager
 
     private void OnKeyPress(XKeyEvent e)
     {
-        if ((e.state == Mod1Mask) && (e.keycode == XKeysymToKeycode(display_, (KeySym)XK_F4)))
+        bool state = Convert.ToBoolean(e.state);
+        if ((state & Convert.ToBoolean(Mod1Mask)) && (e.keycode == XKeysymToKeycode(display_, (KeySym)XK_F4)))
         {
-            Atom* supported_protocols;
+            Atom* supported_protocols = stackalloc Atom[1];
             int num_supported_protocols;
             if (Convert.ToBoolean(XGetWMProtocols(display_, e.window, &supported_protocols, &num_supported_protocols)))
             {
@@ -370,15 +404,29 @@ unsafe class WindowManager
                 msg.xclient.window = e.window;
                 msg.xclient.format = 32;
                 msg.xclient.data.l[0] = WM_DELETE_WINDOW;
-                XSendEvent(display_, e.window, False, 0, &msg);
+                if ( Convert.ToBoolean(XSendEvent(display_, e.window, False, 0, &msg)))
+                {
+                    return;
+                }
             }
             else
             {
                 XKillClient(display_, (XID)e.window.Value);
             }
         }
-        else if ((e.state == Mod1Mask) && (e.keycode == XKeysymToKeycode(display_, (KeySym)XK_Tab)))
+        else if ((state & Convert.ToBoolean(Mod1Mask)) && (e.keycode == XKeysymToKeycode(display_, (KeySym)XK_Tab)))
         {
+            var i = clients_.ContainsKey(e.window);
+            if (i != Convert.ToBoolean(clients_.Count()))
+            {
+                return;
+            }
+
+            if (i == Convert.ToBoolean(clients_.Count()))
+            {
+                i = Convert.ToBoolean(clients_.ElementAt(1));
+            }
+
             XRaiseWindow(display_, e.window);
             XSetInputFocus(display_, e.window, RevertToPointerRoot, (Time)CurrentTime);
         }
@@ -416,14 +464,13 @@ unsafe class WindowManager
             Console.WriteLine("Error bad accesses...");
         }
 
-        wm_detected_ = true;
+        wm_detected_ = false;
         return 0;
     }
 }
 
 unsafe class Program
 {
-    // int main(int argc, char *argv) { ... }
     static int Main(string[] args)
     {
         WindowManager wm = WindowManager.Create(string.Empty);
