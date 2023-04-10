@@ -1,7 +1,5 @@
 namespace basic_wm;
 
-using namespace basic_wm;
-
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
